@@ -14,7 +14,7 @@ class Config:
     img_size: int = 224
 
     batch_size: int = 32
-    num_workers: int = 4
+    num_workers: int = 0
 
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4

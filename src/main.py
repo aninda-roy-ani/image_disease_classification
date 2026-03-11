@@ -23,7 +23,7 @@ def main():
 
     print("Datasets and dataloaders initialized")
 
-    model = build_model(config)
+    model = build_model(config, use_repact=True)
     model = model.to(config.device)
 
     print(f"Model loaded and moved to {config.device}")
@@ -63,6 +63,9 @@ def main():
         )
 
     print("\nTraining completed")
+
+    torch.save(model.state_dict(), config.best_model_path)
+    print("Model saved successfully.")
 
     test_loss, test_accuracy = evaluate(
         model,
