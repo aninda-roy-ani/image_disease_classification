@@ -63,3 +63,17 @@ def get_rays(H, W, focal, transform_matrix):
 
     return rays_o, rays_d
 
+def sample_points(rays_o, rays_d, near, far, num_samples):
+    t_vals = torch.linspace(near, far, steps=num_samples)
+    t_vals = t_vals.view(1, 1, num_samples, 1)
+    points = rays_o[..., None, :] + t_vals * rays_d[..., None, :]
+    return points, t_vals
+
+
+if __name__ == "__main__":
+    images, poses, focal, H, W = load_blender_data("chair")
+    rays_o, rays_d = get_rays(H, W, focal, poses[0])
+    points, t_vals = sample_points(rays_o, rays_d, near=2.0, far=6.0, num_samples=64)
+
+    print(points.shape)
+    print(t_vals.shape)
