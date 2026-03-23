@@ -69,11 +69,22 @@ def sample_points(rays_o, rays_d, near, far, num_samples):
     points = rays_o[..., None, :] + t_vals * rays_d[..., None, :]
     return points, t_vals
 
+def positional_encoding(x, num_freqs):
+    out = [x]
+    for i in range(num_freqs):
+        out.append(torch.sin((2.0 ** i) * x))
+        out.append(torch.cos((2.0 ** i) * x))
+    return torch.cat(out, dim=-1)
+
 
 if __name__ == "__main__":
     images, poses, focal, H, W = load_blender_data("chair")
     rays_o, rays_d = get_rays(H, W, focal, poses[0])
     points, t_vals = sample_points(rays_o, rays_d, near=2.0, far=6.0, num_samples=64)
 
+    encoded_points = positional_encoding(points, num_freqs=10)
+    encoded_dirs = positional_encoding(rays_d[..., None, :].expand_as(points), num_freqs=4)
+
     print(points.shape)
-    print(t_vals.shape)
+    print(encoded_points.shape)
+    print(encoded_dirs.shape)
