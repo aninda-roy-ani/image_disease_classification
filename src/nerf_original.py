@@ -77,14 +77,198 @@ def positional_encoding(x, num_freqs):
     return torch.cat(out, dim=-1)
 
 
+import torch.nn as nn
+
+
+class NerfModel(nn.Module):
+    def __init__(self, pos_dim, dir_dim, hidden_dim=128):
+        super().__init__()
+
+        self.block1 = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        self.block2 = nn.Sequential(
+            nn.Linear(hidden_dim + pos_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim + 1)
+        )
+
+        self.block3 = nn.Sequential(
+            nn.Linear(hidden_dim + dir_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+
+        self.block4 = nn.Sequential(
+            nn.Linear(hidden_dim // 2, 3),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x, d):
+        h = self.block1(x)
+        h = self.block2(torch.cat([h, x], dim=-1))
+
+        sigma = self.relu(h[..., 0])
+        features = h[..., 1:]
+
+        h = self.block3(torch.cat([features, d], dim=-1))
+        rgb = self.block4(h)
+
+        return rgb, sigma
+    
+
+def volume_render(rgb, sigma, t_vals):
+    deltas = t_vals[..., 1:, 0] - t_vals[..., :-1, 0]
+    delta_inf = torch.full_like(deltas[..., :1], 1e10)
+    deltas = torch.cat([deltas, delta_inf], dim=-1)
+
+    alpha = 1.0 - torch.exp(-sigma * deltas)
+    trans = torch.cumprod(
+        torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
+        dim=-1
+    )[..., :-1]
+    weights = alpha * trans
+
+    rendered_rgb = torch.sum(weights[..., None] * rgb, dim=-2)
+    depth_map = torch.sum(weights * t_vals[..., 0], dim=-1)
+    acc_map = torch.sum(weights, dim=-1)
+
+    return rendered_rgb, depth_map, acc_map, weights
+
+
+def train_nerf(model, images, poses, focal, H, W, num_epochs=100, lr=5e-4,
+               near=2.0, far=6.0, num_samples=64, pos_freqs=10, dir_freqs=4,
+               device="cpu"):
+    model = model.to(device)
+    images = images.to(device)
+    poses = poses.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+
+        for idx in range(images.shape[0]):
+            image = images[idx]
+            transform_matrix = poses[idx]
+
+            rays_o, rays_d = get_rays(H, W, focal, transform_matrix)
+            rays_o = rays_o.to(device)
+            rays_d = rays_d.to(device)
+
+            points, t_vals = sample_points(rays_o, rays_d, near=near, far=far, num_samples=num_samples)
+            points = points.to(device)
+            t_vals = t_vals.to(device)
+
+            encoded_points = positional_encoding(points, num_freqs=pos_freqs)
+
+            view_dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+            view_dirs = view_dirs[..., None, :].expand_as(points)
+            encoded_dirs = positional_encoding(view_dirs, num_freqs=dir_freqs)
+
+            rgb, sigma = model(encoded_points, encoded_dirs)
+            rendered_rgb, depth_map, acc_map, weights = volume_render(rgb, sigma, t_vals)
+
+            loss = torch.mean((rendered_rgb - image) ** 2)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / images.shape[0]
+        print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {avg_loss:.6f}")
+
+    return model
+
 if __name__ == "__main__":
-    images, poses, focal, H, W = load_blender_data("chair")
-    rays_o, rays_d = get_rays(H, W, focal, poses[0])
-    points, t_vals = sample_points(rays_o, rays_d, near=2.0, far=6.0, num_samples=64)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    encoded_points = positional_encoding(points, num_freqs=10)
-    encoded_dirs = positional_encoding(rays_d[..., None, :].expand_as(points), num_freqs=4)
+    scene = "chair"
+    split = "train"
+    pos_freqs = 10
+    dir_freqs = 4
+    hidden_dim = 128
+    num_samples = 64
+    near = 2.0
+    far = 6.0
+    num_epochs = 10
+    lr = 5e-4
 
-    print(points.shape)
-    print(encoded_points.shape)
-    print(encoded_dirs.shape)
+    images, poses, focal, H, W = load_blender_data(scene, split=split)
+
+    sample_points_for_shape, _ = sample_points(
+        *get_rays(H, W, focal, poses[0]),
+        near=near,
+        far=far,
+        num_samples=num_samples
+    )
+
+    sample_rays_o, sample_rays_d = get_rays(H, W, focal, poses[0])
+    sample_view_dirs = sample_rays_d / torch.norm(sample_rays_d, dim=-1, keepdim=True)
+    sample_view_dirs = sample_view_dirs[..., None, :].expand_as(sample_points_for_shape)
+
+    encoded_points = positional_encoding(sample_points_for_shape, num_freqs=pos_freqs)
+    encoded_dirs = positional_encoding(sample_view_dirs, num_freqs=dir_freqs)
+
+    pos_dim = encoded_points.shape[-1]
+    dir_dim = encoded_dirs.shape[-1]
+
+    model = NerfModel(pos_dim=pos_dim, dir_dim=dir_dim, hidden_dim=hidden_dim)
+
+    model = train_nerf(
+        model=model,
+        images=images,
+        poses=poses,
+        focal=focal,
+        H=H,
+        W=W,
+        num_epochs=num_epochs,
+        lr=lr,
+        near=near,
+        far=far,
+        num_samples=num_samples,
+        pos_freqs=pos_freqs,
+        dir_freqs=dir_freqs,
+        device=device
+    )
+
+    image = images[0].to(device)
+    transform_matrix = poses[0].to(device)
+
+    rays_o, rays_d = get_rays(H, W, focal, transform_matrix)
+    rays_o = rays_o.to(device)
+    rays_d = rays_d.to(device)
+
+    points, t_vals = sample_points(rays_o, rays_d, near=near, far=far, num_samples=num_samples)
+    points = points.to(device)
+    t_vals = t_vals.to(device)
+
+    encoded_points = positional_encoding(points, num_freqs=pos_freqs)
+
+    view_dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    view_dirs = view_dirs[..., None, :].expand_as(points)
+    encoded_dirs = positional_encoding(view_dirs, num_freqs=dir_freqs)
+
+    with torch.no_grad():
+        rgb, sigma = model(encoded_points, encoded_dirs)
+        rendered_rgb, depth_map, acc_map, weights = volume_render(rgb, sigma, t_vals)
+        loss = torch.mean((rendered_rgb - image) ** 2)
+
+    print("rendered_rgb:", rendered_rgb.shape)
+    print("depth_map:", depth_map.shape)
+    print("acc_map:", acc_map.shape)
+    print("weights:", weights.shape)
+    print("final loss:", loss.item())
+
+    torch.save(model.state_dict(), "nerf_model.pth")
