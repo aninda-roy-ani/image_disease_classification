@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+from src.activations import RepAct_Softmax
+
 
 DATASET_ROOT = Path(r"E:\Python Projects\image_disease_classification\nerf_synthetic")
 
@@ -47,9 +49,11 @@ def load_blender_data(scene: str, split: str = "train", white_bg: bool = True):
     return images, poses, focal, H, W
 
 
-def get_rays(H, W, focal, transform_matrix):
+def get_rays(H, W, focal, transform_matrix, device):
     i, j = torch.meshgrid(
-        torch.arange(W), torch.arange(H), indexing="xy"
+        torch.arange(W, device=device),
+        torch.arange(H, device=device),
+        indexing="xy"
     )
     i = i.float()
     j = j.float()
@@ -67,17 +71,24 @@ def get_rays(H, W, focal, transform_matrix):
 
 
 def sample_points(rays_o, rays_d, near, far, num_samples):
-    t_vals = torch.linspace(near, far, steps=num_samples)
-    t_vals = t_vals.view(1, 1, num_samples, 1)
-    points = rays_o[..., None, :] + t_vals * rays_d[..., None, :]
+    t_vals = torch.linspace(
+        near,
+        far,
+        steps=num_samples,
+        device=rays_o.device,
+        dtype=rays_o.dtype
+    )
+    t_vals = t_vals.view(1, num_samples, 1)
+    points = rays_o[:, None, :] + t_vals * rays_d[:, None, :]
     return points, t_vals
 
 
 def positional_encoding(x, num_freqs):
     out = [x]
     for i in range(num_freqs):
-        out.append(torch.sin((2.0 ** i) * x))
-        out.append(torch.cos((2.0 ** i) * x))
+        freq = 2.0 ** i
+        out.append(torch.sin(freq * x))
+        out.append(torch.cos(freq * x))
     return torch.cat(out, dim=-1)
 
 
@@ -87,24 +98,24 @@ class NerfModel(nn.Module):
 
         self.block1 = nn.Sequential(
             nn.Linear(pos_dim, hidden_dim),
-            nn.ReLU(),
+            RepAct_Softmax(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            RepAct_Softmax(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            RepAct_Softmax(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            RepAct_Softmax()
         )
 
         self.block2 = nn.Sequential(
             nn.Linear(hidden_dim + pos_dim, hidden_dim),
-            nn.ReLU(),
+            RepAct_Softmax(),
             nn.Linear(hidden_dim, hidden_dim + 1)
         )
 
         self.block3 = nn.Sequential(
             nn.Linear(hidden_dim + dir_dim, hidden_dim // 2),
-            nn.ReLU()
+            RepAct_Softmax()
         )
 
         self.block4 = nn.Sequential(
@@ -112,13 +123,13 @@ class NerfModel(nn.Module):
             nn.Sigmoid()
         )
 
-        self.relu = nn.ReLU()
+        self.sigma_activation = nn.Softplus()
 
     def forward(self, x, d):
         h = self.block1(x)
         h = self.block2(torch.cat([h, x], dim=-1))
 
-        sigma = self.relu(h[..., 0])
+        sigma = self.sigma_activation(h[..., 0:1]).squeeze(-1)
         features = h[..., 1:]
 
         h = self.block3(torch.cat([features, d], dim=-1))
@@ -128,18 +139,22 @@ class NerfModel(nn.Module):
 
 
 def volume_render(rgb, sigma, t_vals):
-    deltas = t_vals[..., 1:, 0] - t_vals[..., :-1, 0]
-    delta_inf = torch.full_like(deltas[..., :1], 1e10)
+    deltas = t_vals[:, 1:, 0] - t_vals[:, :-1, 0]
+    delta_inf = torch.full_like(deltas[:, :1], 1e10)
     deltas = torch.cat([deltas, delta_inf], dim=-1)
 
+    sigma = torch.clamp(sigma, min=0.0, max=100.0)
     alpha = 1.0 - torch.exp(-sigma * deltas)
-    trans = torch.cumprod(
-        torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
-        dim=-1
-    )[..., :-1]
-    weights = alpha * trans
+    alpha = torch.clamp(alpha, 0.0, 1.0)
 
-    rendered_rgb = torch.sum(weights[..., None] * rgb, dim=-2)
+    trans = torch.cumprod(
+        torch.cat([torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10], dim=-1),
+        dim=-1
+    )[:, :-1]
+
+    weights = alpha * trans
+    rendered_rgb = torch.sum(weights[..., None] * rgb, dim=1)
+
     return rendered_rgb
 
 
@@ -148,20 +163,47 @@ def psnr(pred, target):
     return -10.0 * torch.log10(mse + 1e-10)
 
 
+def psnr_to_score(psnr_value, max_psnr=30.0):
+    return min(psnr_value / max_psnr, 1.0) * 100.0
+
+
+def render_rays(model, rays_o, rays_d, num_samples=32, pos_freqs=6, dir_freqs=4, near=2.0, far=6.0):
+    points, t_vals = sample_points(rays_o, rays_d, near, far, num_samples)
+
+    encoded_points = positional_encoding(points, pos_freqs)
+
+    view_dirs = rays_d / (torch.norm(rays_d, dim=-1, keepdim=True) + 1e-9)
+    view_dirs = view_dirs[:, None, :].expand(-1, num_samples, -1)
+    encoded_dirs = positional_encoding(view_dirs, dir_freqs)
+
+    rgb, sigma = model(encoded_points, encoded_dirs)
+    rendered = volume_render(rgb, sigma, t_vals)
+
+    return rendered
+
+
 def train(model, images, poses, focal, H, W, epochs=10, lr=5e-4, device="cpu"):
     model.to(device)
     images = images.to(device)
     poses = poses.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    mse_loss = nn.MSELoss()
 
     N_rand = 1024
     num_samples = 32
     pos_freqs = 6
     dir_freqs = 4
+    grad_clip = 1.0
 
-    coords = torch.stack(torch.meshgrid(
-        torch.arange(H), torch.arange(W), indexing='ij'), -1).reshape(-1, 2)
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        ),
+        dim=-1
+    ).reshape(-1, 2)
 
     for epoch in range(epochs):
         total_loss = 0.0
@@ -170,92 +212,92 @@ def train(model, images, poses, focal, H, W, epochs=10, lr=5e-4, device="cpu"):
             image = images[i]
             pose = poses[i]
 
-            rays_o_full, rays_d_full = get_rays(H, W, focal, pose)
-            rays_o_full = rays_o_full.to(device)
-            rays_d_full = rays_d_full.to(device)
+            rays_o_full, rays_d_full = get_rays(H, W, focal, pose, device)
 
-            select = coords[torch.randint(0, coords.shape[0], (N_rand,))]
+            select = coords[torch.randint(0, coords.shape[0], (N_rand,), device=device)]
             rays_o = rays_o_full[select[:, 0], select[:, 1]]
             rays_d = rays_d_full[select[:, 0], select[:, 1]]
             target = image[select[:, 0], select[:, 1]]
 
-            points, t_vals = sample_points(rays_o, rays_d, 2.0, 6.0, num_samples)
-            points = points.to(device)
-            t_vals = t_vals.to(device)
+            rendered = render_rays(
+                model,
+                rays_o,
+                rays_d,
+                num_samples=num_samples,
+                pos_freqs=pos_freqs,
+                dir_freqs=dir_freqs
+            )
 
-            encoded_points = positional_encoding(points, pos_freqs)
+            loss = mse_loss(rendered, target)
 
-            view_dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
-            view_dirs = view_dirs[:, None, :].expand_as(points)
-            encoded_dirs = positional_encoding(view_dirs, dir_freqs)
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"NaN/Inf loss at epoch {epoch + 1}, image {i + 1}")
+                return model
 
-            rgb, sigma = model(encoded_points, encoded_dirs)
-            rendered = volume_render(rgb, sigma, t_vals)
-
-            loss = torch.mean((rendered - target) ** 2)
-
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1} Loss: {total_loss/len(images):.6f}")
+        print(f"Epoch {epoch + 1} Loss: {total_loss / len(images):.6f}")
 
     return model
 
 
 if __name__ == "__main__":
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    scene_name = "chair"
 
-    images, poses, focal, H, W = load_blender_data("chair")
+    images, poses, focal, H, W = load_blender_data(scene_name, split="train")
 
-    rays_o, rays_d = get_rays(H, W, focal, poses[0])
+    sample_rays_o, sample_rays_d = get_rays(H, W, focal, poses[0].to(device), device)
+    sample_rays_o = sample_rays_o[:1, :1].reshape(-1, 3)
+    sample_rays_d = sample_rays_d[:1, :1].reshape(-1, 3)
+    sample_points_xyz, _ = sample_points(sample_rays_o, sample_rays_d, 2.0, 6.0, 32)
 
-    rays_o = rays_o[:1, :1]
-    rays_d = rays_d[:1, :1]
+    pos_dim = positional_encoding(sample_points_xyz, 6).shape[-1]
 
-    points, _ = sample_points(rays_o, rays_d, 2.0, 6.0, 32)
+    sample_view_dirs = sample_rays_d / (torch.norm(sample_rays_d, dim=-1, keepdim=True) + 1e-9)
+    sample_view_dirs = sample_view_dirs[:, None, :].expand(-1, 32, -1)
+    dir_dim = positional_encoding(sample_view_dirs, 4).shape[-1]
 
-    pos_dim = positional_encoding(points, 6).shape[-1]
-    dir_dim = positional_encoding(rays_d[..., None, :].expand_as(points), 4).shape[-1]
-
-    model = NerfModel(pos_dim, dir_dim)
+    model = NerfModel(
+        pos_dim=pos_dim,
+        dir_dim=dir_dim,
+        hidden_dim=128
+    )
 
     model = train(model, images, poses, focal, H, W, epochs=10, device=device)
 
     image = images[0].to(device)
     pose = poses[0].to(device)
 
-    rays_o_full, rays_d_full = get_rays(H, W, focal, pose)
-    rays_o_full = rays_o_full.to(device)
-    rays_d_full = rays_d_full.to(device)
+    rays_o_full, rays_d_full = get_rays(H, W, focal, pose, device)
 
     N_rand = 2048
-    coords = torch.stack(torch.meshgrid(
-        torch.arange(H), torch.arange(W), indexing='ij'), -1).reshape(-1, 2)
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        ),
+        dim=-1
+    ).reshape(-1, 2)
 
-    select = coords[torch.randint(0, coords.shape[0], (N_rand,))]
+    select = coords[torch.randint(0, coords.shape[0], (N_rand,), device=device)]
     rays_o = rays_o_full[select[:, 0], select[:, 1]]
     rays_d = rays_d_full[select[:, 0], select[:, 1]]
     target = image[select[:, 0], select[:, 1]]
 
-    points, t_vals = sample_points(rays_o, rays_d, 2.0, 6.0, 32)
-    points = points.to(device)
-    t_vals = t_vals.to(device)
-
-    encoded_points = positional_encoding(points, 6)
-
-    view_dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
-    view_dirs = view_dirs[:, None, :].expand_as(points)
-    encoded_dirs = positional_encoding(view_dirs, 4)
-
     with torch.no_grad():
-        rgb, sigma = model(encoded_points, encoded_dirs)
-        rendered = volume_render(rgb, sigma, t_vals)
+        rendered = render_rays(model, rays_o, rays_d, num_samples=32, pos_freqs=6, dir_freqs=4)
 
     score = psnr(rendered, target)
-    print("PSNR:", score.item())
+    score_percent = psnr_to_score(score.item(), max_psnr=30.0)
 
-    torch.save(model.state_dict(), "nerf_model.pth")
+    print("PSNR:", score.item())
+    print("Score (%):", score_percent)
+
+    torch.save(model.state_dict(), "nerf_model_repact_softmax.pth")
