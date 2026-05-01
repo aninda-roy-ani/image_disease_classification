@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.init as init
 import matplotlib
+import torch.nn.functional as F
 
 matplotlib.use("Agg")
 
@@ -153,3 +154,36 @@ class RepAct_BN(nn.Module):
 
         plt.savefig(strSave)
         plt.close()
+
+
+class APALU(nn.Module):
+    def __init__(self, init_alpha=1.0, init_beta=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(init_alpha, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.tensor(init_beta, dtype=torch.float32))
+
+    def forward(self, x):
+        positive = F.relu(x)
+        negative = self.alpha * (torch.exp(self.beta * torch.minimum(x, torch.zeros_like(x))) - 1.0)
+        return positive + negative
+
+
+class ParMish(nn.Module):
+    def __init__(self, init_alpha=1.0, init_beta=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(init_alpha, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.tensor(init_beta, dtype=torch.float32))
+
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(self.alpha * x)) * self.beta
+
+
+class APISine(nn.Module):
+    def __init__(self, init_alpha=1.0, init_beta=1.0, init_gamma=0.1):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(init_alpha, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.tensor(init_beta, dtype=torch.float32))
+        self.gamma = nn.Parameter(torch.tensor(init_gamma, dtype=torch.float32))
+
+    def forward(self, x):
+        return x + self.gamma * torch.sin(self.alpha * x + self.beta)
